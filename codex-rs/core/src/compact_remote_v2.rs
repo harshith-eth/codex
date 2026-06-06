@@ -32,6 +32,7 @@ use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
@@ -51,6 +52,8 @@ const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
 // Compact attempts can run much longer than normal turns, so keep the per-transport
 // retry budget smaller than the general Responses stream retry budget.
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: u64 = 2;
+const REMOTE_COMPACTION_V2_CAPACITY_FALLBACK_EFFORT: ReasoningEffortConfig =
+    ReasoningEffortConfig::Low;
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
@@ -332,6 +335,8 @@ async fn run_remote_compaction_request_v2(
         .info()
         .stream_max_retries()
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
+    let mut effort = turn_context.reasoning_effort.clone();
+    let mut capacity_fallback_attempted = false;
     let mut retries = 0;
     loop {
         let result = match client_session
@@ -339,7 +344,7 @@ async fn run_remote_compaction_request_v2(
                 prompt,
                 &turn_context.model_info,
                 &turn_context.session_telemetry,
-                turn_context.reasoning_effort.clone(),
+                effort.clone(),
                 turn_context.reasoning_summary,
                 turn_context.config.service_tier.clone(),
                 turn_metadata_header,
@@ -354,6 +359,21 @@ async fn run_remote_compaction_request_v2(
         match result {
             Ok(compaction_output) => return Ok(compaction_output),
             Err(err) if !err.is_retryable() => {
+                if let Some(fallback_effort) =
+                    remote_compaction_v2_capacity_fallback_effort(&err, effort.as_ref())
+                    && !capacity_fallback_attempted
+                {
+                    capacity_fallback_attempted = true;
+                    retries = 0;
+                    info!(
+                        turn_id = %turn_context.sub_id,
+                        compact_error = %err,
+                        fallback_effort = %fallback_effort,
+                        "remote compaction v2 failed due to capacity; retrying with lower reasoning effort"
+                    );
+                    effort = Some(fallback_effort);
+                    continue;
+                }
                 log_remote_compaction_request_failure(sess, turn_context, prompt, &err).await;
                 return Err(err);
             }
@@ -369,11 +389,53 @@ async fn run_remote_compaction_request_v2(
                 )
                 .await
                 {
+                    if let Some(fallback_effort) =
+                        remote_compaction_v2_capacity_fallback_effort(&err, effort.as_ref())
+                        && !capacity_fallback_attempted
+                    {
+                        capacity_fallback_attempted = true;
+                        retries = 0;
+                        info!(
+                            turn_id = %turn_context.sub_id,
+                            compact_error = %err,
+                            fallback_effort = %fallback_effort,
+                            "remote compaction v2 exhausted retry budget due to capacity; retrying with lower reasoning effort"
+                        );
+                        effort = Some(fallback_effort);
+                        continue;
+                    }
                     log_remote_compaction_request_failure(sess, turn_context, prompt, &err).await;
                     return Err(err);
                 }
             }
         }
+    }
+}
+
+fn remote_compaction_v2_capacity_fallback_effort(
+    err: &CodexErr,
+    effort: Option<&ReasoningEffortConfig>,
+) -> Option<ReasoningEffortConfig> {
+    if !matches!(
+        err,
+        CodexErr::InternalServerError | CodexErr::ServerOverloaded
+    ) {
+        return None;
+    }
+
+    match effort {
+        Some(
+            ReasoningEffortConfig::Medium
+            | ReasoningEffortConfig::High
+            | ReasoningEffortConfig::XHigh
+            | ReasoningEffortConfig::Custom(_),
+        ) => Some(REMOTE_COMPACTION_V2_CAPACITY_FALLBACK_EFFORT),
+        Some(
+            ReasoningEffortConfig::None
+            | ReasoningEffortConfig::Minimal
+            | ReasoningEffortConfig::Low,
+        )
+        | None => None,
     }
 }
 

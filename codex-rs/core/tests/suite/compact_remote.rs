@@ -11,6 +11,7 @@ use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::ConversationStartParams;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
@@ -1030,6 +1031,125 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
     assert!(
         !follow_up_body.contains("FAILED_COMPACT_SUMMARY"),
         "expected failed compaction attempt output to be discarded"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_compact_v2_retries_capacity_failure_with_lower_reasoning_effort() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                let _ = config.features.enable(Feature::RemoteCompactionV2);
+                config.model_provider.request_max_retries = Some(0);
+                config.model_provider.stream_max_retries = Some(0);
+                config.model_reasoning_effort = Some(ReasoningEffort::XHigh);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+
+    let responses_mock = responses::mount_response_sequence(
+        harness.server(),
+        vec![
+            responses::sse_response(responses::sse(vec![
+                responses::ev_assistant_message("m1", "FIRST_REMOTE_REPLY"),
+                responses::ev_completed("resp-1"),
+            ])),
+            ResponseTemplate::new(500).set_body_string("compact capacity error"),
+            responses::sse_response(responses::sse(vec![
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "LOW_EFFORT_COMPACT_SUMMARY",
+                    }
+                }),
+                responses::ev_completed("resp-compact-low-effort"),
+            ])),
+            responses::sse_response(responses::sse(vec![
+                responses::ev_assistant_message("m2", "AFTER_COMPACT_REPLY"),
+                responses::ev_completed("resp-2"),
+            ])),
+        ],
+    )
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "hello remote compact".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_turn_complete(&codex).await;
+
+    codex.submit(Op::Compact).await?;
+    wait_for_turn_complete(&codex).await;
+
+    codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "after compact".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_turn_complete(&codex).await;
+
+    let response_requests = responses_mock.requests();
+    assert_eq!(
+        4,
+        response_requests.len(),
+        "expected initial turn, failed compact, lower-effort compact retry, and follow-up turn"
+    );
+
+    let failed_compact_request = &response_requests[1];
+    let fallback_compact_request = &response_requests[2];
+    assert_eq!("/v1/responses", failed_compact_request.path());
+    assert_eq!("/v1/responses", fallback_compact_request.path());
+
+    for compact_request in [failed_compact_request, fallback_compact_request] {
+        assert!(
+            compact_request
+                .body_json()
+                .to_string()
+                .contains("\"type\":\"compaction_trigger\""),
+            "expected compact request to include the compaction_trigger item"
+        );
+    }
+
+    assert_eq!(
+        failed_compact_request.body_json()["reasoning"]["effort"],
+        "xhigh"
+    );
+    assert_eq!(
+        fallback_compact_request.body_json()["reasoning"]["effort"],
+        "low"
+    );
+
+    let follow_up_request = response_requests.last().expect("follow-up request missing");
+    assert!(
+        follow_up_request
+            .body_json()
+            .to_string()
+            .contains("LOW_EFFORT_COMPACT_SUMMARY"),
+        "expected follow-up request to include the fallback compaction payload"
     );
 
     Ok(())
